@@ -1016,7 +1016,8 @@ static int fuse_fill_super(struct super_block *sb, void *data, int silent)
 	if (sb->s_flags & MS_MANDLOCK)
 		goto err;
 
-	sb->s_flags &= ~MS_NOSEC;
+	// sb->s_flags &= ~MS_NOSEC;
+	sb->s_flags |= MS_NOSEC;
 
 	if (!parse_fuse_opt((char *) data, &d, is_bdev))
 		goto err;
@@ -1163,6 +1164,15 @@ static struct file_system_type fuse_fs_type = {
 };
 MODULE_ALIAS_FS("fuse");
 
+static struct file_system_type fusenew_fs_type = {
+	.owner		= THIS_MODULE,
+	.name		= "fusenew",
+	.fs_flags	= FS_HAS_SUBTYPE,
+	.mount		= fuse_mount,
+	.kill_sb	= fuse_kill_sb_anon,
+};
+MODULE_ALIAS_FS("fusenew");
+
 #ifdef CONFIG_BLOCK
 static struct dentry *fuse_mount_blk(struct file_system_type *fs_type,
 			   int flags, const char *dev_name,
@@ -1240,8 +1250,14 @@ static int __init fuse_fs_init(void)
 	if (err)
 		goto out3;
 
+	err = register_filesystem(&fusenew_fs_type);
+	if (err)
+		goto out4;
+
 	return 0;
 
+ out4:
+	unregister_filesystem(&fuse_fs_type);
  out3:
 	unregister_fuseblk();
  out2:
@@ -1252,6 +1268,7 @@ static int __init fuse_fs_init(void)
 
 static void fuse_fs_cleanup(void)
 {
+	unregister_filesystem(&fusenew_fs_type);
 	unregister_filesystem(&fuse_fs_type);
 	unregister_fuseblk();
 
