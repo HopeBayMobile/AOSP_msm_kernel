@@ -7,7 +7,6 @@
 */
 
 #include "fuse_i.h"
-#include "fuse_shortcircuit.h"
 
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -22,8 +21,7 @@
 static const struct file_operations fuse_direct_io_file_operations;
 
 static int fuse_send_open(struct fuse_conn *fc, u64 nodeid, struct file *file,
-			  int opcode, struct fuse_open_out *outargp,
-			  struct file **lower_file)
+			  int opcode, struct fuse_open_out *outargp)
 {
 	struct fuse_open_in inarg;
 	struct fuse_req *req;
@@ -47,10 +45,6 @@ static int fuse_send_open(struct fuse_conn *fc, u64 nodeid, struct file *file,
 	req->out.args[0].value = outargp;
 	fuse_request_send(fc, req);
 	err = req->out.h.error;
-
-	if (!err && req->private_lower_rw_file != NULL)
-		*lower_file =  req->private_lower_rw_file;
-
 	fuse_put_request(fc, req);
 
 	return err;
@@ -64,10 +58,6 @@ struct fuse_file *fuse_file_alloc(struct fuse_conn *fc)
 	if (unlikely(!ff))
 		return NULL;
 
-	ff->rw_lower_file = NULL;
-	ff->shortcircuit_enabled = 0;
-	if (fc->shortcircuit_io)
-		ff->shortcircuit_enabled = 1;
 	ff->fc = fc;
 	ff->reserved_req = fuse_request_alloc(0);
 	if (unlikely(!ff->reserved_req)) {
@@ -163,8 +153,7 @@ int fuse_do_open(struct fuse_conn *fc, u64 nodeid, struct file *file,
 	if (!ff)
 		return -ENOMEM;
 
-	err = fuse_send_open(fc, nodeid, file, opcode, &outarg,
-			     &(ff->rw_lower_file));
+	err = fuse_send_open(fc, nodeid, file, opcode, &outarg);
 	if (err) {
 		fuse_file_free(ff);
 		return err;
@@ -271,8 +260,6 @@ void fuse_release_common(struct file *file, int opcode)
 	ff = file->private_data;
 	if (unlikely(!ff))
 		return;
-
-	fuse_shortcircuit_release(ff);
 
 	req = ff->reserved_req;
 	fuse_prepare_release(ff, file->f_flags, opcode);
@@ -888,44 +875,6 @@ static int fuse_readpages_fill(void *_data, struct page *page)
 		return -EIO;
 	}
 
-#ifdef CONFIG_CMA
-	if (is_cma_pageblock(page)) {
-		struct page *oldpage = page, *newpage;
-		int err;
-
-		/* make sure that old page is not free in-between the calls */
-		page_cache_get(oldpage);
-
-		newpage = alloc_page(GFP_HIGHUSER);
-		if (!newpage) {
-			page_cache_release(oldpage);
-			return -ENOMEM;
-		}
-
-		lock_page(newpage);
-		err = replace_page_cache_page(oldpage, newpage, GFP_KERNEL);
-		if (err) {
-			unlock_page(newpage);
-			__free_page(newpage);
-			page_cache_release(oldpage);
-			return err;
-		}
-
-		/*
-		 * Decrement the count on new page to make page cache the only
-		 * owner of it
-		 */
-		put_page(newpage);
-
-		lru_cache_add_file(newpage);
-
-		/* finally release the old page and swap pointers */
-		unlock_page(oldpage);
-		page_cache_release(oldpage);
-		page = newpage;
-	}
-#endif
-
 	page_cache_get(page);
 	req->pages[req->num_pages] = page;
 	req->page_descs[req->num_pages].length = PAGE_SIZE;
@@ -972,10 +921,8 @@ out:
 static ssize_t fuse_file_aio_read(struct kiocb *iocb, const struct iovec *iov,
 				  unsigned long nr_segs, loff_t pos)
 {
-	ssize_t ret_val;
 	struct inode *inode = iocb->ki_filp->f_mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
-	struct fuse_file *ff = iocb->ki_filp->private_data;
 
 	/*
 	 * In auto invalidate mode, always update attributes on read.
@@ -990,12 +937,7 @@ static ssize_t fuse_file_aio_read(struct kiocb *iocb, const struct iovec *iov,
 			return err;
 	}
 
-	if (ff && ff->shortcircuit_enabled && ff->rw_lower_file)
-		ret_val = fuse_shortcircuit_aio_read(iocb, iov, nr_segs, pos);
-	else
-		ret_val = generic_file_aio_read(iocb, iov, nr_segs, pos);
-
-	return ret_val;
+	return generic_file_aio_read(iocb, iov, nr_segs, pos);
 }
 
 static void fuse_write_fill(struct fuse_req *req, struct fuse_file *ff,
@@ -1235,7 +1177,6 @@ static ssize_t fuse_file_aio_write(struct kiocb *iocb, const struct iovec *iov,
 	struct address_space *mapping = file->f_mapping;
 	size_t count = 0;
 	size_t ocount = 0;
-	struct fuse_file *ff = file->private_data;
 	ssize_t written = 0;
 	ssize_t written_buffered = 0;
 	struct inode *inode = mapping->host;
@@ -1279,12 +1220,6 @@ static ssize_t fuse_file_aio_write(struct kiocb *iocb, const struct iovec *iov,
 	err = file_update_time(file);
 	if (err)
 		goto out;
-
-	if (ff && ff->shortcircuit_enabled && ff->rw_lower_file) {
-		written = fuse_shortcircuit_aio_write(iocb, iov, nr_segs,
-						      iocb->ki_pos);
-		goto out;
-	}
 
 	if (file->f_flags & O_DIRECT) {
 		written = generic_file_direct_write(iocb, iov, &nr_segs,
@@ -1431,18 +1366,13 @@ static inline int fuse_iter_npages(const struct iov_iter *ii_p)
 
 ssize_t fuse_direct_io(struct fuse_io_priv *io, const struct iovec *iov,
 		       unsigned long nr_segs, size_t count, loff_t *ppos,
-		       int flags)
+		       int write)
 {
-	int write = flags & FUSE_DIO_WRITE;
-	int cuse = flags & FUSE_DIO_CUSE;
 	struct file *file = io->file;
-	struct inode *inode = file->f_mapping->host;
 	struct fuse_file *ff = file->private_data;
 	struct fuse_conn *fc = ff->fc;
 	size_t nmax = write ? fc->max_write : fc->max_read;
 	loff_t pos = *ppos;
-	pgoff_t idx_from = pos >> PAGE_CACHE_SHIFT;
-	pgoff_t idx_to = (pos + count - 1) >> PAGE_CACHE_SHIFT;
 	ssize_t res = 0;
 	struct fuse_req *req;
 	struct iov_iter ii;
@@ -1455,14 +1385,6 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, const struct iovec *iov,
 		req = fuse_get_req(fc, fuse_iter_npages(&ii));
 	if (IS_ERR(req))
 		return PTR_ERR(req);
-
-	if (!cuse && fuse_range_is_writeback(inode, idx_from, idx_to)) {
-		if (!write)
-			mutex_lock(&inode->i_mutex);
-		fuse_sync_writes(inode);
-		if (!write)
-			mutex_unlock(&inode->i_mutex);
-	}
 
 	while (count) {
 		size_t nres;
@@ -1552,8 +1474,7 @@ static ssize_t __fuse_direct_write(struct fuse_io_priv *io,
 
 	res = generic_write_checks(file, ppos, &count, 0);
 	if (!res)
-		res = fuse_direct_io(io, iov, nr_segs, count, ppos,
-				     FUSE_DIO_WRITE);
+		res = fuse_direct_io(io, iov, nr_segs, count, ppos, 1);
 
 	fuse_invalidate_attr(inode);
 
@@ -1602,7 +1523,7 @@ static void fuse_writepage_finish(struct fuse_conn *fc, struct fuse_req *req)
 
 /* Called under fc->lock, may release and reacquire it */
 static void fuse_send_writepage(struct fuse_conn *fc, struct fuse_req *req,
-				loff_t size)
+                                loff_t size)
 __releases(fc->lock)
 __acquires(fc->lock)
 {
@@ -2030,6 +1951,7 @@ out:
 	return err;
 }
 
+
 /*
  * It's worthy to make sure that space is reserved on disk for the write,
  * but how to implement it without killing performance need more thinking.
@@ -2159,9 +2081,6 @@ static const struct vm_operations_struct fuse_file_vm_ops = {
 
 static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	struct fuse_file *ff = file->private_data;
-
-	ff->shortcircuit_enabled = 0;
 	if ((vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_MAYWRITE))
 		fuse_link_write_file(file);
 
@@ -2172,10 +2091,6 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 
 static int fuse_direct_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	struct fuse_file *ff = file->private_data;
-
-	ff->shortcircuit_enabled = 0;
-
 	/* Can't provide the coherency needed for MAP_SHARED */
 	if (vma->vm_flags & VM_MAYSHARE)
 		return -ENODEV;
@@ -2815,7 +2730,7 @@ static void fuse_register_polled_file(struct fuse_conn *fc,
 {
 	spin_lock(&fc->lock);
 	if (RB_EMPTY_NODE(&ff->polled_node)) {
-		struct rb_node **link, *uninitialized_var(parent);
+		struct rb_node **link, *parent;
 
 		link = fuse_find_polled_node(fc, ff->kh, &parent);
 		BUG_ON(*link);
@@ -3076,8 +2991,11 @@ out:
 	if (!(mode & FALLOC_FL_KEEP_SIZE))
 		clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 
-	if (lock_inode)
+	if (lock_inode) {
+		if (mode & FALLOC_FL_PUNCH_HOLE)
+			fuse_release_nowrite(inode);
 		mutex_unlock(&inode->i_mutex);
+	}
 
 	return err;
 }

@@ -476,17 +476,6 @@ static const match_table_t tokens = {
 	{OPT_ERR,			NULL}
 };
 
-static int fuse_match_uint(substring_t *s, unsigned int *res)
-{
-	int err = -ENOMEM;
-	char *buf = match_strdup(s);
-	if (buf) {
-		err = kstrtouint(buf, 10, res);
-		kfree(buf);
-	}
-	return err;
-}
-
 static int parse_fuse_opt(char *opt, struct fuse_mount_data *d, int is_bdev)
 {
 	char *p;
@@ -497,7 +486,6 @@ static int parse_fuse_opt(char *opt, struct fuse_mount_data *d, int is_bdev)
 	while ((p = strsep(&opt, ",")) != NULL) {
 		int token;
 		int value;
-		unsigned uv;
 		substring_t args[MAX_OPT_ARGS];
 		if (!*p)
 			continue;
@@ -521,18 +509,18 @@ static int parse_fuse_opt(char *opt, struct fuse_mount_data *d, int is_bdev)
 			break;
 
 		case OPT_USER_ID:
-			if (fuse_match_uint(&args[0], &uv))
+			if (match_int(&args[0], &value))
 				return 0;
-			d->user_id = make_kuid(current_user_ns(), uv);
+			d->user_id = make_kuid(current_user_ns(), value);
 			if (!uid_valid(d->user_id))
 				return 0;
 			d->user_id_present = 1;
 			break;
 
 		case OPT_GROUP_ID:
-			if (fuse_match_uint(&args[0], &uv))
+			if (match_int(&args[0], &value))
 				return 0;
-			d->group_id = make_kgid(current_user_ns(), uv);
+			d->group_id = make_kgid(current_user_ns(), value);
 			if (!gid_valid(d->group_id))
 				return 0;
 			d->group_id_present = 1;
@@ -813,7 +801,7 @@ static const struct super_operations fuse_super_operations = {
 static void sanitize_global_limit(unsigned *limit)
 {
 	if (*limit == 0)
-		*limit = ((totalram_pages << PAGE_SHIFT) >> 13) /
+		*limit = ((num_physpages << PAGE_SHIFT) >> 13) /
 			 sizeof(struct fuse_req);
 
 	if (*limit >= 1 << 16)
@@ -904,12 +892,6 @@ static void process_init_reply(struct fuse_conn *fc, struct fuse_req *req)
 				fc->async_dio = 1;
 			if (arg->flags & FUSE_WRITEBACK_CACHE)
 				fc->writeback_cache = 1;
-			if (arg->flags & FUSE_SHORTCIRCUIT) {
-				fc->writeback_cache = 0;
-				fc->shortcircuit_io = 1;
-				pr_info("FUSE: SHORTCIRCUIT enabled [%s : %d]!\n",
-					current->comm, current->pid);
-			}
 		} else {
 			ra_pages = fc->max_read / PAGE_CACHE_SIZE;
 			fc->no_lock = 1;
@@ -966,7 +948,7 @@ static int fuse_bdi_init(struct fuse_conn *fc, struct super_block *sb)
 	fc->bdi.name = "fuse";
 	fc->bdi.ra_pages = (VM_MAX_READAHEAD * 1024) / PAGE_CACHE_SIZE;
 	/* fuse does it's own writeback accounting */
-	fc->bdi.capabilities = BDI_CAP_NO_ACCT_WB | BDI_CAP_STRICTLIMIT;
+	fc->bdi.capabilities = BDI_CAP_NO_ACCT_WB;
 
 	err = bdi_init(&fc->bdi);
 	if (err)
@@ -1016,7 +998,9 @@ static int fuse_fill_super(struct super_block *sb, void *data, int silent)
 	if (sb->s_flags & MS_MANDLOCK)
 		goto err;
 
-	// sb->s_flags &= ~MS_NOSEC;
+/*
+	sb->s_flags &= ~MS_NOSEC;
+*/
 	sb->s_flags |= MS_NOSEC;
 
 	if (!parse_fuse_opt((char *) data, &d, is_bdev))
@@ -1171,7 +1155,6 @@ static struct file_system_type fusenew_fs_type = {
 	.mount		= fuse_mount,
 	.kill_sb	= fuse_kill_sb_anon,
 };
-MODULE_ALIAS_FS("fusenew");
 
 #ifdef CONFIG_BLOCK
 static struct dentry *fuse_mount_blk(struct file_system_type *fs_type,
