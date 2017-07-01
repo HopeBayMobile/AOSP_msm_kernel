@@ -1237,6 +1237,8 @@ static int __init fuse_fs_init(void)
 	if (err)
 		goto out4;
 
+	spin_lock_init(&hcfs_handling_lock);
+
 	return 0;
 
  out4:

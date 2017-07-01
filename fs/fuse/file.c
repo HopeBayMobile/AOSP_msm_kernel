@@ -17,8 +17,13 @@
 #include <linux/swap.h>
 #include <linux/aio.h>
 #include <linux/falloc.h>
+#include <linux/delay.h>
 
 static const struct file_operations fuse_direct_io_file_operations;
+
+long hcfs_avail_space;
+long hcfs_handling_space;
+spinlock_t hcfs_handling_lock;
 
 static int fuse_send_open(struct fuse_conn *fc, u64 nodeid, struct file *file,
 			  int opcode, struct fuse_open_out *outargp)
@@ -1183,14 +1188,30 @@ static ssize_t fuse_file_aio_write(struct kiocb *iocb, const struct iovec *iov,
 	ssize_t err;
 	struct iov_iter i;
 	loff_t endbyte = 0;
+	int is_hcfs;
+	size_t len;
 
-	if (get_fuse_conn(inode)->writeback_cache) {
+	is_hcfs = !strcmp(inode->i_sb->s_type->name, "fusenew");
+	len = iov_length(iov, nr_segs);
+
+	if (is_hcfs) {
+		spin_lock(&hcfs_handling_lock);
+		hcfs_handling_space += len;
+		spin_unlock(&hcfs_handling_lock);
+	}
+
+	if ((!is_hcfs || hcfs_avail_space - hcfs_handling_space >= 0)
+	    && get_fuse_conn(inode)->writeback_cache) {
 		/* Update size (EOF optimization) and mode (SUID clearing) */
 		err = fuse_update_attributes(mapping->host, NULL, file, NULL);
 		if (err)
-			return err;
+			goto out2;
 
-		return generic_file_aio_write(iocb, iov, nr_segs, pos);
+		written = generic_file_aio_write(iocb, iov, nr_segs, pos);
+		if (written < 0)
+			goto out2;
+
+		return written;
 	}
 
 	WARN_ON(iocb->ki_pos != pos);
@@ -1198,7 +1219,7 @@ static ssize_t fuse_file_aio_write(struct kiocb *iocb, const struct iovec *iov,
 	ocount = 0;
 	err = generic_segment_checks(iov, &nr_segs, &ocount, VERIFY_READ);
 	if (err)
-		return err;
+		goto out2;
 
 	count = ocount;
 	mutex_lock(&inode->i_mutex);
@@ -1259,6 +1280,13 @@ static ssize_t fuse_file_aio_write(struct kiocb *iocb, const struct iovec *iov,
 out:
 	current->backing_dev_info = NULL;
 	mutex_unlock(&inode->i_mutex);
+
+out2:
+	if (is_hcfs) {
+		spin_lock(&hcfs_handling_lock);
+		hcfs_handling_space -= len;
+		spin_unlock(&hcfs_handling_lock);
+	}
 
 	return written ? written : err;
 }
@@ -1590,6 +1618,12 @@ static void fuse_writepage_end(struct fuse_conn *fc, struct fuse_req *req)
 {
 	struct inode *inode = req->inode;
 	struct fuse_inode *fi = get_fuse_inode(inode);
+
+	if (!strcmp(inode->i_sb->s_type->name, "fusenew")) {
+		spin_lock(&hcfs_handling_lock);
+		hcfs_handling_space -= req->misc.write.in.size;
+		spin_unlock(&hcfs_handling_lock);
+	}
 
 	mapping_set_error(inode->i_mapping, req->out.h.error);
 	spin_lock(&fc->lock);

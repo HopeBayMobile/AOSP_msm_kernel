@@ -2166,6 +2166,22 @@ static int fuse_dev_fasync(int fd, struct file *file, int on)
 	return fasync_helper(fd, file, on, &fc->fasync);
 }
 
+static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
+			   unsigned long arg)
+{
+	switch (cmd) {
+	case FUSE_HCFS_AVAIL_SPACE_NOTIFY:
+	{
+		hcfs_avail_space = arg;
+		return 0;
+	}
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 const struct file_operations fuse_dev_operations = {
 	.owner		= THIS_MODULE,
 	.llseek		= no_llseek,
@@ -2178,6 +2194,7 @@ const struct file_operations fuse_dev_operations = {
 	.poll		= fuse_dev_poll,
 	.release	= fuse_dev_release,
 	.fasync		= fuse_dev_fasync,
+	.unlocked_ioctl	= fuse_dev_ioctl,
 };
 EXPORT_SYMBOL_GPL(fuse_dev_operations);
 

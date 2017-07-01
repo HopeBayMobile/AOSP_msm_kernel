@@ -22,6 +22,7 @@
 #include <linux/rbtree.h>
 #include <linux/poll.h>
 #include <linux/workqueue.h>
+#include <linux/ioctl.h>
 
 /** Max number of pages that can be used in a single read request */
 #define FUSE_MAX_PAGES_PER_REQ 32
@@ -46,6 +47,11 @@
 
 /** Number of page pointers embedded in fuse_req */
 #define FUSE_REQ_INLINE_PAGES 1
+
+#define FUSE_HCFS_AVAIL_SPACE_NOTIFY	_IOW(0xff, 0x01, long)
+
+extern long hcfs_avail_space;
+extern spinlock_t hcfs_handling_lock;
 
 /** List of active connections */
 extern struct list_head fuse_conn_list;
