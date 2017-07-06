@@ -22,6 +22,7 @@
 #include <linux/rbtree.h>
 #include <linux/poll.h>
 #include <linux/workqueue.h>
+#include <linux/ioctl.h>
 
 /** Max number of pages that can be used in a single read request */
 #define FUSE_MAX_PAGES_PER_REQ 32
@@ -46,6 +47,11 @@
 
 /** Number of page pointers embedded in fuse_req */
 #define FUSE_REQ_INLINE_PAGES 1
+
+#define FUSE_HCFS_AVAIL_SPACE_NOTIFY	_IOW(0xff, 0x01, long)
+
+extern long hcfs_avail_space;
+extern spinlock_t hcfs_handling_lock;
 
 /** List of active connections */
 extern struct list_head fuse_conn_list;
@@ -157,10 +163,6 @@ struct fuse_file {
 
 	/** Has flock been performed on this file? */
 	bool flock:1;
-
-	/* the read write file */
-	struct file *rw_lower_file;
-	bool shortcircuit_enabled;
 };
 
 /** One input argument of a request */
@@ -369,9 +371,6 @@ struct fuse_req {
 
 	/** Request is stolen from fuse_file->reserved_req */
 	struct file *stolen_file;
-
-	/** fuse shortcircuit file  */
-	struct file *private_lower_rw_file;
 };
 
 /**
@@ -493,9 +492,6 @@ struct fuse_conn {
 
 	/** write-back cache policy (default is write-through) */
 	unsigned writeback_cache:1;
-
-	/** Shortcircuited IO. */
-	unsigned shortcircuit_io:1;
 
 	/*
 	 * The following bitfields are only for optimization purposes
@@ -877,20 +873,9 @@ int fuse_reverse_inval_entry(struct super_block *sb, u64 parent_nodeid,
 
 int fuse_do_open(struct fuse_conn *fc, u64 nodeid, struct file *file,
 		 bool isdir);
-
-/**
- * fuse_direct_io() flags
- */
-
-/** If set, it is WRITE; otherwise - READ */
-#define FUSE_DIO_WRITE (1 << 0)
-
-/** CUSE pass fuse_direct_io() a file which f_mapping->host is not from FUSE */
-#define FUSE_DIO_CUSE  (1 << 1)
-
 ssize_t fuse_direct_io(struct fuse_io_priv *io, const struct iovec *iov,
 		       unsigned long nr_segs, size_t count, loff_t *ppos,
-		       int flags);
+		       int write);
 long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
 		   unsigned int flags);
 long fuse_ioctl_common(struct file *file, unsigned int cmd,

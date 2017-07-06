@@ -517,9 +517,6 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 	if (err)
 		goto out_free_ff;
 
-	if (req->private_lower_rw_file != NULL)
-		ff->rw_lower_file = req->private_lower_rw_file;
-
 	err = -EIO;
 	if (!S_ISREG(outentry.attr.mode) || invalid_nodeid(outentry.nodeid))
 		goto out_free_ff;
@@ -1241,8 +1238,6 @@ static int parse_dirfile(char *buf, size_t nbytes, struct file *file,
 			return -EIO;
 		if (reclen > nbytes)
 			break;
-		if (memchr(dirent->name, '/', dirent->namelen) != NULL)
-			return -EIO;
 
 		over = filldir(dstbuf, dirent->name, dirent->namelen,
 			       file->f_pos, dirent->ino, dirent->type);
@@ -1293,29 +1288,13 @@ static int fuse_direntplus_link(struct file *file,
 		if (name.name[1] == '.' && name.len == 2)
 			return 0;
 	}
-
-	if (invalid_nodeid(o->nodeid))
-		return -EIO;
-	if (!fuse_valid_type(o->attr.mode))
-		return -EIO;
-
 	fc = get_fuse_conn(dir);
 
 	name.hash = full_name_hash(name.name, name.len);
 	dentry = d_lookup(parent, &name);
-	if (dentry) {
+	if (dentry && dentry->d_inode) {
 		inode = dentry->d_inode;
-		if (!inode) {
-			d_drop(dentry);
-		} else if (get_node_id(inode) != o->nodeid ||
-			   ((o->attr.mode ^ inode->i_mode) & S_IFMT)) {
-			err = d_invalidate(dentry);
-			if (err)
-				goto out;
-		} else if (is_bad_inode(inode)) {
-			err = -EIO;
-			goto out;
-		} else {
+		if (get_node_id(inode) == o->nodeid) {
 			struct fuse_inode *fi;
 			fi = get_fuse_inode(inode);
 			spin_lock(&fc->lock);
@@ -1328,6 +1307,9 @@ static int fuse_direntplus_link(struct file *file,
 			 */
 			goto found;
 		}
+		err = d_invalidate(dentry);
+		if (err)
+			goto out;
 		dput(dentry);
 		dentry = NULL;
 	}
@@ -1342,19 +1324,10 @@ static int fuse_direntplus_link(struct file *file,
 	if (!inode)
 		goto out;
 
-	if (S_ISDIR(inode->i_mode)) {
-		mutex_lock(&fc->inst_mutex);
-		alias = fuse_d_add_directory(dentry, inode);
-		mutex_unlock(&fc->inst_mutex);
-		err = PTR_ERR(alias);
-		if (IS_ERR(alias)) {
-			iput(inode);
-			goto out;
-		}
-	} else {
-		alias = d_splice_alias(inode, dentry);
-	}
-
+	alias = d_materialise_unique(dentry, inode);
+	err = PTR_ERR(alias);
+	if (IS_ERR(alias))
+		goto out;
 	if (alias) {
 		dput(dentry);
 		dentry = alias;
@@ -1391,8 +1364,6 @@ static int parse_dirplusfile(char *buf, size_t nbytes, struct file *file,
 			return -EIO;
 		if (reclen > nbytes)
 			break;
-		if (memchr(dirent->name, '/', dirent->namelen) != NULL)
-			return -EIO;
 
 		if (!over) {
 			/* We fill entries into dstbuf only as much as
@@ -1470,7 +1441,7 @@ static int fuse_readdir(struct file *file, void *dstbuf, filldir_t filldir)
 	}
 
 	__free_page(page);
-	fuse_invalidate_atime(inode);
+	fuse_invalidate_atime(inode); /* atime changed */
 	return err;
 }
 
@@ -1503,7 +1474,7 @@ static char *read_link(struct dentry *dentry)
 		link[req->out.args[0].size] = '\0';
  out:
 	fuse_put_request(fc, req);
-	fuse_invalidate_atime(inode);
+	fuse_invalidate_atime(inode); /* atime changed */
 	return link;
 }
 
@@ -1814,8 +1785,7 @@ int fuse_do_setattr(struct inode *inode, struct iattr *attr,
 	 * Only call invalidate_inode_pages2() after removing
 	 * FUSE_NOWRITE, otherwise fuse_launder_page() would deadlock.
 	 */
-	if ((is_truncate || !is_wb) &&
-	    S_ISREG(inode->i_mode) && oldsize != outarg.attr.size) {
+	if (S_ISREG(inode->i_mode) && oldsize != outarg.attr.size) {
 		truncate_pagecache(inode, oldsize, outarg.attr.size);
 		invalidate_inode_pages2(inode->i_mapping);
 	}
@@ -2027,17 +1997,6 @@ static int fuse_removexattr(struct dentry *entry, const char *name)
 	return err;
 }
 
-static int fuse_update_time(struct inode *inode, struct timespec *now,
-			    int flags)
-{
-	if (flags & S_MTIME) {
-		inode->i_mtime = *now;
-		set_bit(FUSE_I_MTIME_DIRTY, &get_fuse_inode(inode)->state);
-		BUG_ON(!S_ISREG(inode->i_mode));
-	}
-	return 0;
-}
-
 static const struct inode_operations fuse_dir_inode_operations = {
 	.lookup		= fuse_lookup,
 	.mkdir		= fuse_mkdir,
@@ -2077,7 +2036,6 @@ static const struct inode_operations fuse_common_inode_operations = {
 	.getxattr	= fuse_getxattr,
 	.listxattr	= fuse_listxattr,
 	.removexattr	= fuse_removexattr,
-	.update_time	= fuse_update_time,
 };
 
 static const struct inode_operations fuse_symlink_inode_operations = {
